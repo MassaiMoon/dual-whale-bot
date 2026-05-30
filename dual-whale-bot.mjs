@@ -2,7 +2,7 @@ import fetch from "node-fetch";
 
 const BOT_TOKEN      = process.env.BOT_TOKEN;
 const CHAT_ID        = "-1003979928587";
-const MIN_USD        = 1000;
+const MIN_USD        = 5;
 const POLL_MS        = 30_000;
 const HEADER_IMG = "AgACAgQAAxkBAAMLahsaxWL-qj5Rttn21HUd_pXCL9wAAoESaxtYctlQSq9wyE-vZM0BAAMCAAN5AAM7BA";
 
