@@ -24,11 +24,18 @@ function formatDual(n) {
 }
 
 async function fetchPair() {
-  const url = `https://api.dexscreener.com/latest/dex/pairs/base/${PAIR}`;
+  // Use token address endpoint — more reliable than pair address
+  const url = `https://api.dexscreener.com/token-pairs/v1/base/${DUAL_TOKEN}`;
   const res  = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
   if (!res.ok) throw new Error(`Dexscreener HTTP ${res.status}`);
   const data = await res.json();
-  return data.pair ?? null;
+  // data is an array of pairs — find the one matching our pair address
+  if (!Array.isArray(data) || data.length === 0) return null;
+  // prefer our specific pair, otherwise use highest liquidity pair
+  const match = data.find(p => p.pairAddress?.toLowerCase() === PAIR.toLowerCase())
+    ?? data.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
+  console.log(`Using pair: ${match.pairAddress} (${match.baseToken?.symbol}/${match.quoteToken?.symbol})`);
+  return match;
 }
 
 let lastVolumeH1 = null;
@@ -47,7 +54,7 @@ async function processNewTrades() {
   if (lastVolumeH1 === null) {
     lastVolumeH1 = currentVolumeH1;
     lastPriceUsd = currentPrice;
-    console.log("Baseline set");
+    console.log("Baseline set ✅");
     return;
   }
 
