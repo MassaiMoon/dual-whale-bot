@@ -2,9 +2,9 @@ import fetch from "node-fetch";
 
 const BOT_TOKEN      = process.env.BOT_TOKEN;
 const CHAT_ID        = "-1003979928587";
-const MIN_USD        = 5;
+const MIN_USD        = 1000;
 const POLL_MS        = 30_000;
-const HEADER_IMG     = "https://i.postimg.cc/XqpFwTGR/f9abbb99-dcae-4b93-a3a1-2456749da4e2.jpg";
+const HEADER_IMG = "AgACAgQAAxkBAAMLahsaxWL-qj5Rttn21HUd_pXCL9wAAoESaxtYctlQSq9wyE-vZM0BAAMCAAN5AAM7BA";
 
 const CHAINS = [
   {
@@ -128,7 +128,7 @@ async function sendAlert({ usd, dualAmt, price, mcap, pairAddress, maker, txHash
   const res  = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: CHAT_ID, photo: HEADER_IMG, caption, parse_mode: "Markdown" }),
+    body: JSON.stringify({ chat_id: CHAT_ID, photo: HEADER_IMG, caption, parse_mode: "Markdown", disable_web_page_preview: true }),
   });
   const json = await res.json();
   if (!json.ok) console.error("Telegram error:", JSON.stringify(json));
