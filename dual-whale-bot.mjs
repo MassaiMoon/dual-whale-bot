@@ -1,8 +1,8 @@
 import fetch from "node-fetch";
 
 const BOT_TOKEN      = process.env.BOT_TOKEN;
-const CHAT_ID        = "-1003979928587";
-const MIN_USD        = 500;
+const CHAT_IDS = ["-1003979928587", "-1002857896980"];
+const MIN_USD        = 700;
 const POLL_MS        = 30_000;
 const HEADER_IMG = "AgACAgQAAxkBAAMLahsaxWL-qj5Rttn21HUd_pXCL9wAAoESaxtYctlQSq9wyE-vZM0BAAMCAAN5AAM7BA";
 
@@ -124,15 +124,17 @@ async function sendAlert({ usd, dualAmt, price, mcap, pairAddress, maker, txHash
     `[Chart](https://dexscreener.com/${chain}/${pairAddress}) · [Buy DUAL](https://app.uniswap.org/swap?outputCurrency=${CHAINS.find(c=>c.name===chain)?.token})`,
   ].filter(Boolean).join("\n");
 
-  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`;
-  const res  = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: CHAT_ID, photo: HEADER_IMG, caption, parse_mode: "Markdown", disable_web_page_preview: true }),
-  });
-  const json = await res.json();
-  if (!json.ok) console.error("Telegram error:", JSON.stringify(json));
-  else console.log(`✅ Alerted: ${formatUsd(usd)} buy on ${label}`);
+  for (const chatId of CHAT_IDS) {
+    const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`;
+    const res  = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, photo: HEADER_IMG, caption, parse_mode: "Markdown", disable_web_page_preview: true }),
+    });
+    const json = await res.json();
+    if (!json.ok) console.error(`Telegram error (${chatId}):`, JSON.stringify(json));
+    else console.log(`✅ Alerted: ${formatUsd(usd)} buy on ${label} -> ${chatId}`);
+  }
 }
 
 async function main() {
