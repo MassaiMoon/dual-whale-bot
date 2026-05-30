@@ -1,11 +1,11 @@
 import fetch from "node-fetch";
 
-const BOT_TOKEN  = process.env.BOT_TOKEN;
-const CHAT_ID    = "-1003979928587";
-const DUAL_TOKEN = "0x6aF487BEb661CCeCD1D045E9561A0dAC9AA5c7db";
-const MIN_USD    = 1;
-const POLL_MS    = 30_000;
-const HEADER_IMG = "https://i.imgur.com/pxgb6mN.jpeg";
+const BOT_TOKEN       = process.env.BOT_TOKEN;
+const CHAT_ID         = "-1003979928587";
+const DUAL_TOKEN_BASE = "0x832b55B0fA6397ca9e63B8c15DAdeF3f6E44614c";
+const MIN_USD         = 1;
+const POLL_MS         = 30_000;
+const HEADER_IMG      = "https://i.imgur.com/pxgb6mN.jpeg";
 
 const seenTxns = new Set();
 
@@ -23,8 +23,7 @@ function formatDual(n) {
 }
 
 async function fetchPair() {
-  // Query Ethereum mainnet for DUAL token pairs
-  const url = `https://api.dexscreener.com/token-pairs/v1/ethereum/${DUAL_TOKEN}`;
+  const url = `https://api.dexscreener.com/token-pairs/v1/base/${DUAL_TOKEN_BASE}`;
   const res  = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
   if (!res.ok) throw new Error(`Dexscreener HTTP ${res.status}`);
   const data = await res.json();
@@ -78,7 +77,7 @@ async function sendAlert(usd, dualAmt, price, mcap, pairAddress) {
     `💵 Price ${formatUsd(price)}`,
     mcap ? `📊 Market Cap ${formatUsd(mcap)}` : null,
     ``,
-    `[Chart](https://dexscreener.com/ethereum/${pairAddress}) · [Buy DUAL](https://app.uniswap.org/swap?outputCurrency=${DUAL_TOKEN}&chain=mainnet)`,
+    `[Chart](https://dexscreener.com/base/${pairAddress}) · [Buy DUAL](https://app.uniswap.org/swap?outputCurrency=${DUAL_TOKEN_BASE}&chain=base)`,
   ].filter(Boolean).join("\n");
 
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`;
