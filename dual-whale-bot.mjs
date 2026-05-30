@@ -6,6 +6,7 @@ import fetch from "node-fetch";
 
 const BOT_TOKEN  = process.env.BOT_TOKEN;
 const CHAT_ID    = "-1003979928587";
+const DUAL_TOKEN = "0x6aF487BEb26B6d9f4d9B9A6aBf4E19c8aAb6b3E4"; // DUAL token on Base
 const PAIR       = "0x832b55B0fA6397ca9e63B8c15DAdeF3f6E44614c";
 const MIN_USD    = 1000;
 const POLL_MS    = 30_000;
@@ -15,7 +16,7 @@ const seenTxns = new Set();
 
 function butterflies(usd) {
   const count = Math.max(1, Math.round(usd / 100));
-  return "🦋".repeat(Math.min(count, 60)); // cap at 60 so message doesn't get too long
+  return "🦋".repeat(Math.min(count, 60));
 }
 
 function formatUsd(n) {
@@ -30,44 +31,87 @@ function formatDual(n) {
 }
 
 async function fetchTrades() {
-  const url = `https://api.dexscreener.com/latest/dex/trades/${PAIR}`;
-  const res  = await fetch(url);
-  if (!res.ok) throw new Error(`Dexscreener HTTP ${res.status}`);
-  const data = await res.json();
-  return data.trades ?? [];
-}
-
-async function fetchPairInfo() {
+  // Use token-pairs endpoint to get recent trades via pair data
   const url = `https://api.dexscreener.com/latest/dex/pairs/base/${PAIR}`;
-  const res  = await fetch(url);
-  if (!res.ok) return null;
+  const res  = await fetch(url, {
+    headers: { "User-Agent": "Mozilla/5.0" }
+  });
+  if (!res.ok) throw new Error(`Dexscreener HTTP ${res.status}`);
   const data = await res.json();
   return data.pair ?? null;
 }
 
-async function sendAlert(trade, pair) {
-  const usd     = parseFloat(trade.volumeUsd ?? 0);
-  const dualAmt = parseFloat(trade.amount0 ?? 0);
-  const price   = dualAmt > 0 ? usd / dualAmt : 0;
-  const mcap    = pair?.marketCap ?? pair?.fdv ?? 0;
-  const wallet  = trade.maker
-    ? trade.maker.slice(0, 6) + "..." + trade.maker.slice(-4)
-    : "unknown";
+async function fetchRecentTxns() {
+  // Use token endpoint to get trades
+  const url = `https://api.dexscreener.com/token-pairs/v1/base/${DUAL_TOKEN}`;
+  const res  = await fetch(url, {
+    headers: { "User-Agent": "Mozilla/5.0" }
+  });
+  if (!res.ok) {
+    console.error(`Token pairs HTTP ${res.status}`);
+    return [];
+  }
+  const data = await res.json();
+  // Find our specific pair
+  const pair = Array.isArray(data) 
+    ? data.find(p => p.pairAddress?.toLowerCase() === PAIR.toLowerCase())
+    : null;
+  return pair;
+}
 
+// Track price and volume to detect big buys via volume spikes
+let lastVolumeH1 = null;
+let lastPriceUsd = null;
+
+async function processNewTrades() {
+  const pair = await fetchTrades();
+  if (!pair) return;
+
+  const currentVolumeH1 = parseFloat(pair?.volume?.h1 ?? 0);
+  const currentPrice    = parseFloat(pair?.priceUsd ?? 0);
+  const mcap            = pair?.marketCap ?? pair?.fdv ?? 0;
+
+  // On first run, just store baseline
+  if (lastVolumeH1 === null) {
+    lastVolumeH1 = currentVolumeH1;
+    lastPriceUsd = currentPrice;
+    console.log(`Baseline set — volume H1: $${currentVolumeH1.toFixed(0)}, price: $${currentPrice}`);
+    return;
+  }
+
+  const volumeDelta = currentVolumeH1 - lastVolumeH1;
+  const priceChange = currentPrice - lastPriceUsd;
+
+  // A big buy shows up as: volume increased AND price went up
+  if (volumeDelta >= MIN_USD && priceChange >= 0) {
+    const txKey = `${Date.now()}-${volumeDelta.toFixed(0)}`;
+    if (!seenTxns.has(txKey)) {
+      seenTxns.add(txKey);
+      if (seenTxns.size > 500) seenTxns.clear();
+
+      const estDual = volumeDelta / currentPrice;
+      await sendAlert(volumeDelta, estDual, currentPrice, mcap);
+    }
+  }
+
+  lastVolumeH1 = currentVolumeH1;
+  lastPriceUsd = currentPrice;
+}
+
+async function sendAlert(usd, dualAmt, price, mcap) {
   const caption = [
     `*DUAL Token Buy!*`,
     butterflies(usd),
     ``,
-    `💲 ${formatUsd(usd)} (${formatUsd(usd)} USDT)`,
-    `🔷 ${formatDual(dualAmt)}`,
-    `👤 [Buyer](https://basescan.org/address/${trade.maker}) / [TX](https://basescan.org/tx/${trade.txHash})`,
+    `💲 ${formatUsd(usd)} USDT`,
+    `🔷 ~${formatDual(dualAmt)}`,
     `💵 Price ${formatUsd(price)}`,
     mcap ? `📊 Market Cap ${formatUsd(mcap)}` : null,
     ``,
-    `[Chart](https://dexscreener.com/base/${PAIR}) · [Buy DUAL](https://app.uniswap.org/#/swap?outputCurrency=0x6aF487BEb26B6d9f4d9B9A6aBf4E19c8aAb6b3E4)`,
+    `[Chart](https://dexscreener.com/base/${PAIR}) · [Buy DUAL](https://app.uniswap.org/swap?outputCurrency=${DUAL_TOKEN}&chain=base)`,
   ].filter(Boolean).join("\n");
 
-  const url  = `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`;
+  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`;
   const res  = await fetch(url, {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
@@ -81,22 +125,6 @@ async function sendAlert(trade, pair) {
   const json = await res.json();
   if (!json.ok) console.error("Telegram error:", JSON.stringify(json));
   else console.log(`✅ Alerted: ${formatUsd(usd)} buy`);
-}
-
-async function processNewTrades() {
-  const [trades, pair] = await Promise.all([fetchTrades(), fetchPairInfo()]);
-
-  for (const t of trades) {
-    if (t.type !== "buy")       continue;
-    if (seenTxns.has(t.txHash)) continue;
-    const usd = parseFloat(t.volumeUsd ?? 0);
-    if (usd < MIN_USD)          continue;
-
-    seenTxns.add(t.txHash);
-    if (seenTxns.size > 2000) seenTxns.clear();
-
-    await sendAlert(t, pair);
-  }
 }
 
 async function main() {
