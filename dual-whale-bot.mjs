@@ -8,7 +8,7 @@ const BOT_TOKEN  = process.env.BOT_TOKEN;
 const CHAT_ID    = "-1003979928587";
 const DUAL_TOKEN = "0x6aF487BEb26B6d9f4d9B9A6aBf4E19c8aAb6b3E4"; // DUAL token on Base
 const PAIR       = "0x832b55B0fA6397ca9e63B8c15DAdeF3f6E44614c";
-const MIN_USD    = 1000;
+const MIN_USD    = 1;
 const POLL_MS    = 30_000;
 const HEADER_IMG = "https://i.imgur.com/pxgb6mN.jpeg";
 
