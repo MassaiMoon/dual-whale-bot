@@ -1,12 +1,11 @@
 import fetch from "node-fetch";
 
-const BOT_TOKEN       = process.env.BOT_TOKEN;
-const CHAT_ID         = "-1003979928587";
-const DUAL_TOKEN_BASE = "0x832b55B0fA6397ca9e63B8c15DAdeF3f6E44614c";
-const DUAL_TOKEN_ETH  = "0x6aF487BEb661CCeCD1D045E9561A0dAC9AA5c7db";
-const MIN_USD         = 1000;
-const POLL_MS         = 30_000;
-const HEADER_IMG      = "https://i.postimg.cc/XqpFwTGR/f9abbb99-dcae-4b93-a3a1-2456749da4e2.jpg";
+const BOT_TOKEN  = process.env.BOT_TOKEN;
+const CHAT_ID    = "-1003979928587";
+const DUAL_TOKEN = "0x6aF487BEb661CCeCD1D045E9561A0dAC9AA5c7db";
+const MIN_USD    = 1000;
+const POLL_MS    = 30_000;
+const HEADER_IMG = "https://i.postimg.cc/XqpFwTGR/f9abbb99-dcae-4b93-a3a1-2456749da4e2.jpg";
 
 const seenTxns = new Set();
 
@@ -24,41 +23,42 @@ function formatDual(n) {
 }
 
 function shortAddr(addr) {
-  if (!addr) return "unknown";
+  if (!addr) return null;
   return addr.slice(0, 6) + "..." + addr.slice(-4);
 }
 
-async function fetchRecentBuys(chain, tokenAddress) {
-  const url = `https://api.dexscreener.com/token-pairs/v1/${chain}/${tokenAddress}`;
+async function fetchPair() {
+  const url = `https://api.dexscreener.com/token-pairs/v1/ethereum/${DUAL_TOKEN}`;
   const res  = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
-  if (!res.ok) return { pair: null, trades: [] };
+  if (!res.ok) throw new Error(`Dexscreener HTTP ${res.status}`);
   const data = await res.json();
-  if (!Array.isArray(data) || data.length === 0) return { pair: null, trades: [] };
-  const pair = data.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
-  return { pair, trades: [] };
+  if (!Array.isArray(data) || data.length === 0) return null;
+  return data.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
 }
 
-async function fetchTrades(chain, pairAddress) {
-  const url = `https://api.dexscreener.com/latest/dex/trades/${chain}/${pairAddress}`;
+async function fetchTrades(pairAddress) {
+  const url = `https://api.dexscreener.com/latest/dex/trades/ethereum/${pairAddress}`;
   const res  = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
   if (!res.ok) return [];
   const data = await res.json();
   return data.trades ?? [];
 }
 
-async function processChain(chain, tokenAddress, explorerBase) {
-  const { pair } = await fetchRecentBuys(chain, tokenAddress);
-  if (!pair) { console.log(`No pair data for ${chain}`); return; }
+let lastVolumeH1 = null;
 
-  const pairAddress = pair.pairAddress;
+async function processNewTrades() {
+  const pair = await fetchPair();
+  if (!pair) { console.log("No pair data"); return; }
+
+  const pairAddress  = pair.pairAddress;
   const currentPrice = parseFloat(pair?.priceUsd ?? 0);
-  const mcap = pair?.marketCap ?? pair?.fdv ?? 0;
+  const mcap         = pair?.marketCap ?? pair?.fdv ?? 0;
 
-  // Try to get individual trades
-  const trades = await fetchTrades(chain, pairAddress);
+  // Try trade-level first (gives us wallet addresses)
+  const trades = await fetchTrades(pairAddress);
 
   if (trades.length > 0) {
-    // Trade-level approach — precise wallet + amount
+    console.log(`Poll — ${trades.length} trades found, price: $${currentPrice.toFixed(8)}`);
     for (const t of trades) {
       if (t.type !== "buy") continue;
       if (seenTxns.has(t.txHash)) continue;
@@ -69,48 +69,35 @@ async function processChain(chain, tokenAddress, explorerBase) {
       if (seenTxns.size > 2000) seenTxns.clear();
 
       const dualAmt = parseFloat(t.amount0 ?? 0);
-      const maker   = t.maker ?? null;
-      await sendAlert({ usd, dualAmt, price: currentPrice, mcap, pairAddress, maker, txHash: t.txHash, chain, explorerBase });
+      await sendAlert({ usd, dualAmt, price: currentPrice, mcap, pairAddress, maker: t.maker, txHash: t.txHash });
     }
   } else {
-    // Fallback: volume-delta approach
-    const volKey = `vol_${chain}`;
+    // Fallback: volume delta
     const currentVol = parseFloat(pair?.volume?.h1 ?? 0);
+    console.log(`Poll — vol H1: $${currentVol.toFixed(0)}, price: $${currentPrice.toFixed(8)}`);
 
-    if (!seenTxns.has(volKey + "_baseline")) {
-      seenTxns.set ? null : null;
-      globalThis[volKey] = currentVol;
-      seenTxns.add(volKey + "_baseline");
-      console.log(`${chain} baseline set — vol H1: $${currentVol.toFixed(0)}`);
+    if (lastVolumeH1 === null) {
+      lastVolumeH1 = currentVol;
+      console.log("Baseline set ✅");
       return;
     }
 
-    const lastVol = globalThis[volKey] ?? currentVol;
-    const delta   = currentVol - lastVol;
-    globalThis[volKey] = currentVol;
-
-    console.log(`${chain} poll — vol H1: $${currentVol.toFixed(0)}, price: $${currentPrice.toFixed(8)}`);
+    const delta = currentVol - lastVolumeH1;
+    lastVolumeH1 = currentVol;
 
     if (delta >= MIN_USD) {
-      const txKey = `${chain}-${Math.round(Date.now()/30000)}-${Math.round(delta)}`;
+      const txKey = `${Math.round(Date.now()/30000)}-${Math.round(delta)}`;
       if (!seenTxns.has(txKey)) {
         seenTxns.add(txKey);
         if (seenTxns.size > 2000) seenTxns.clear();
         const estDual = currentPrice > 0 ? delta / currentPrice : 0;
-        await sendAlert({ usd: delta, dualAmt: estDual, price: currentPrice, mcap, pairAddress, maker: null, txHash: null, chain, explorerBase });
+        await sendAlert({ usd: delta, dualAmt: estDual, price: currentPrice, mcap, pairAddress, maker: null, txHash: null });
       }
     }
   }
 }
 
-async function sendAlert({ usd, dualAmt, price, mcap, pairAddress, maker, txHash, chain, explorerBase }) {
-  const walletLine = maker
-    ? `👤 [${shortAddr(maker)}](${explorerBase}/address/${maker})`
-    : null;
-  const txLine = txHash
-    ? `🔗 [View TX](${explorerBase}/tx/${txHash})`
-    : null;
-
+async function sendAlert({ usd, dualAmt, price, mcap, pairAddress, maker, txHash }) {
   const caption = [
     `*DUAL Token Buy!*`,
     butterflies(usd),
@@ -119,10 +106,10 @@ async function sendAlert({ usd, dualAmt, price, mcap, pairAddress, maker, txHash
     `🔷 ~${formatDual(dualAmt)}`,
     `💵 Price $${price.toFixed(8)}`,
     mcap ? `📊 Market Cap ${formatUsd(mcap)}` : null,
-    walletLine,
-    txLine,
+    maker ? `👤 [${shortAddr(maker)}](https://etherscan.io/address/${maker})` : null,
+    txHash ? `🔗 [View TX](https://etherscan.io/tx/${txHash})` : null,
     ``,
-    `[Chart](https://dexscreener.com/${chain}/${pairAddress}) · [Buy DUAL](https://app.uniswap.org/swap?outputCurrency=${DUAL_TOKEN_ETH})`,
+    `[Chart](https://dexscreener.com/ethereum/${pairAddress}) · [Buy DUAL](https://app.uniswap.org/swap?outputCurrency=${DUAL_TOKEN})`,
   ].filter(Boolean).join("\n");
 
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`;
@@ -133,22 +120,17 @@ async function sendAlert({ usd, dualAmt, price, mcap, pairAddress, maker, txHash
   });
   const json = await res.json();
   if (!json.ok) console.error("Telegram error:", JSON.stringify(json));
-  else console.log(`✅ Alerted: ${formatUsd(usd)} buy on ${chain}`);
+  else console.log(`✅ Alerted: ${formatUsd(usd)} buy`);
 }
 
 async function main() {
   if (!BOT_TOKEN) { console.error("❌  BOT_TOKEN not set."); process.exit(1); }
-  console.log("🦋  DUAL whale bot started — watching for buys ≥ $" + MIN_USD);
-
-  const run = async () => {
-    try { await processChain("base", DUAL_TOKEN_BASE, "https://basescan.org"); } 
-    catch (err) { console.error("Base poll error:", err.message); }
-    try { await processChain("ethereum", DUAL_TOKEN_ETH, "https://etherscan.io"); }
-    catch (err) { console.error("ETH poll error:", err.message); }
-  };
-
-  await run();
-  setInterval(run, POLL_MS);
+  console.log("🦋  DUAL whale bot started — watching ETH buys ≥ $" + MIN_USD);
+  await processNewTrades();
+  setInterval(async () => {
+    try { await processNewTrades(); }
+    catch (err) { console.error("Poll error:", err.message); }
+  }, POLL_MS);
 }
 
 main();
