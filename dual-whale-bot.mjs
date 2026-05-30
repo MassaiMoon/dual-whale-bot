@@ -2,8 +2,7 @@ import fetch from "node-fetch";
 
 const BOT_TOKEN  = process.env.BOT_TOKEN;
 const CHAT_ID    = "-1003979928587";
-const DUAL_TOKEN = "0x6aF487BEb26B6d9f4d9B9A6aBf4E19c8aAb6b3E4";
-const PAIR       = "0x832b55B0fA6397ca9e63B8c15DAdeF3f6E44614c";
+const DUAL_TOKEN = "0x6aF487BEb661CCeCD1D045E9561A0dAC9AA5c7db";
 const MIN_USD    = 1;
 const POLL_MS    = 30_000;
 const HEADER_IMG = "https://i.imgur.com/pxgb6mN.jpeg";
@@ -24,22 +23,18 @@ function formatDual(n) {
 }
 
 async function fetchPair() {
-  // Use token address endpoint — more reliable than pair address
-  const url = `https://api.dexscreener.com/token-pairs/v1/base/${DUAL_TOKEN}`;
+  // Query Ethereum mainnet for DUAL token pairs
+  const url = `https://api.dexscreener.com/token-pairs/v1/ethereum/${DUAL_TOKEN}`;
   const res  = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
   if (!res.ok) throw new Error(`Dexscreener HTTP ${res.status}`);
   const data = await res.json();
-  // data is an array of pairs — find the one matching our pair address
   if (!Array.isArray(data) || data.length === 0) return null;
-  // prefer our specific pair, otherwise use highest liquidity pair
-  const match = data.find(p => p.pairAddress?.toLowerCase() === PAIR.toLowerCase())
-    ?? data.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
-  console.log(`Using pair: ${match.pairAddress} (${match.baseToken?.symbol}/${match.quoteToken?.symbol})`);
-  return match;
+  // Use highest liquidity pair
+  const pair = data.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
+  return pair;
 }
 
 let lastVolumeH1 = null;
-let lastPriceUsd = null;
 
 async function processNewTrades() {
   const pair = await fetchPair();
@@ -48,12 +43,12 @@ async function processNewTrades() {
   const currentVolumeH1 = parseFloat(pair?.volume?.h1 ?? 0);
   const currentPrice    = parseFloat(pair?.priceUsd ?? 0);
   const mcap            = pair?.marketCap ?? pair?.fdv ?? 0;
+  const pairAddress     = pair?.pairAddress ?? "";
 
-  console.log(`Poll — vol H1: $${currentVolumeH1.toFixed(0)}, price: $${currentPrice}`);
+  console.log(`Poll — pair: ${pairAddress.slice(0,10)}... vol H1: $${currentVolumeH1.toFixed(0)}, price: $${currentPrice}`);
 
   if (lastVolumeH1 === null) {
     lastVolumeH1 = currentVolumeH1;
-    lastPriceUsd = currentPrice;
     console.log("Baseline set ✅");
     return;
   }
@@ -61,20 +56,19 @@ async function processNewTrades() {
   const volumeDelta = currentVolumeH1 - lastVolumeH1;
 
   if (volumeDelta >= MIN_USD) {
-    const txKey = `${Math.round(Date.now()/30000)}-${Math.round(volumeDelta)}`;
+    const txKey = `${Math.round(Date.now() / 30000)}-${Math.round(volumeDelta)}`;
     if (!seenTxns.has(txKey)) {
       seenTxns.add(txKey);
       if (seenTxns.size > 500) seenTxns.clear();
       const estDual = currentPrice > 0 ? volumeDelta / currentPrice : 0;
-      await sendAlert(volumeDelta, estDual, currentPrice, mcap);
+      await sendAlert(volumeDelta, estDual, currentPrice, mcap, pairAddress);
     }
   }
 
   lastVolumeH1 = currentVolumeH1;
-  lastPriceUsd = currentPrice;
 }
 
-async function sendAlert(usd, dualAmt, price, mcap) {
+async function sendAlert(usd, dualAmt, price, mcap, pairAddress) {
   const caption = [
     `*DUAL Token Buy!*`,
     butterflies(usd),
@@ -84,7 +78,7 @@ async function sendAlert(usd, dualAmt, price, mcap) {
     `💵 Price ${formatUsd(price)}`,
     mcap ? `📊 Market Cap ${formatUsd(mcap)}` : null,
     ``,
-    `[Chart](https://dexscreener.com/base/${PAIR}) · [Buy DUAL](https://app.uniswap.org/swap?outputCurrency=${DUAL_TOKEN}&chain=base)`,
+    `[Chart](https://dexscreener.com/ethereum/${pairAddress}) · [Buy DUAL](https://app.uniswap.org/swap?outputCurrency=${DUAL_TOKEN}&chain=mainnet)`,
   ].filter(Boolean).join("\n");
 
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`;
