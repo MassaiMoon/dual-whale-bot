@@ -1,13 +1,28 @@
 import fetch from "node-fetch";
 
-const BOT_TOKEN  = process.env.BOT_TOKEN;
-const CHAT_ID    = "-1003979928587";
-const DUAL_TOKEN = "0x6aF487BEb661CCeCD1D045E9561A0dAC9AA5c7db";
-const MIN_USD    = 100;
-const POLL_MS    = 30_000;
-const HEADER_IMG = "https://i.postimg.cc/XqpFwTGR/f9abbb99-dcae-4b93-a3a1-2456749da4e2.jpg";
+const BOT_TOKEN      = process.env.BOT_TOKEN;
+const CHAT_ID        = "-1003979928587";
+const MIN_USD        = 100;
+const POLL_MS        = 30_000;
+const HEADER_IMG     = "https://i.postimg.cc/XqpFwTGR/f9abbb99-dcae-4b93-a3a1-2456749da4e2.jpg";
 
-const seenTxns = new Set();
+const CHAINS = [
+  {
+    name:        "ethereum",
+    token:       "0x6aF487BEb661CCeCD1D045E9561A0dAC9AA5c7db",
+    explorer:    "https://etherscan.io",
+    label:       "ETH",
+  },
+  {
+    name:        "base",
+    token:       "0x832b55B0fA6397ca9e63B8c15DAdeF3f6E44614c",
+    explorer:    "https://basescan.org",
+    label:       "BASE",
+  },
+];
+
+const seenTxns   = new Set();
+const lastVolume = {};  // keyed by chain name
 
 function butterflies(usd) {
   const count = Math.max(1, Math.round(usd / 100));
@@ -27,38 +42,35 @@ function shortAddr(addr) {
   return addr.slice(0, 6) + "..." + addr.slice(-4);
 }
 
-async function fetchPair() {
-  const url = `https://api.dexscreener.com/token-pairs/v1/ethereum/${DUAL_TOKEN}`;
+async function fetchPair(chain, token) {
+  const url = `https://api.dexscreener.com/token-pairs/v1/${chain}/${token}`;
   const res  = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
-  if (!res.ok) throw new Error(`Dexscreener HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`Dexscreener ${chain} HTTP ${res.status}`);
   const data = await res.json();
   if (!Array.isArray(data) || data.length === 0) return null;
   return data.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
 }
 
-async function fetchTrades(pairAddress) {
-  const url = `https://api.dexscreener.com/latest/dex/trades/ethereum/${pairAddress}`;
+async function fetchTrades(chain, pairAddress) {
+  const url = `https://api.dexscreener.com/latest/dex/trades/${chain}/${pairAddress}`;
   const res  = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
   if (!res.ok) return [];
   const data = await res.json();
   return data.trades ?? [];
 }
 
-let lastVolumeH1 = null;
-
-async function processNewTrades() {
-  const pair = await fetchPair();
-  if (!pair) { console.log("No pair data"); return; }
+async function processChain({ name, token, explorer, label }) {
+  const pair = await fetchPair(name, token);
+  if (!pair) { console.log(`[${label}] No pair data`); return; }
 
   const pairAddress  = pair.pairAddress;
   const currentPrice = parseFloat(pair?.priceUsd ?? 0);
   const mcap         = pair?.marketCap ?? pair?.fdv ?? 0;
 
-  // Try trade-level first (gives us wallet addresses)
-  const trades = await fetchTrades(pairAddress);
+  const trades = await fetchTrades(name, pairAddress);
 
   if (trades.length > 0) {
-    console.log(`Poll — ${trades.length} trades found, price: $${currentPrice.toFixed(8)}`);
+    console.log(`[${label}] ${trades.length} trades, price: $${currentPrice.toFixed(8)}`);
     for (const t of trades) {
       if (t.type !== "buy") continue;
       if (seenTxns.has(t.txHash)) continue;
@@ -69,47 +81,47 @@ async function processNewTrades() {
       if (seenTxns.size > 2000) seenTxns.clear();
 
       const dualAmt = parseFloat(t.amount0 ?? 0);
-      await sendAlert({ usd, dualAmt, price: currentPrice, mcap, pairAddress, maker: t.maker, txHash: t.txHash });
+      await sendAlert({ usd, dualAmt, price: currentPrice, mcap, pairAddress, maker: t.maker, txHash: t.txHash, explorer, label, chain: name });
     }
   } else {
-    // Fallback: volume delta
+    // Volume-delta fallback
     const currentVol = parseFloat(pair?.volume?.h1 ?? 0);
-    console.log(`Poll — vol H1: $${currentVol.toFixed(0)}, price: $${currentPrice.toFixed(8)}`);
+    console.log(`[${label}] vol H1: $${currentVol.toFixed(0)}, price: $${currentPrice.toFixed(8)}`);
 
-    if (lastVolumeH1 === null) {
-      lastVolumeH1 = currentVol;
-      console.log("Baseline set ✅");
+    if (lastVolume[name] === undefined) {
+      lastVolume[name] = currentVol;
+      console.log(`[${label}] Baseline set ✅`);
       return;
     }
 
-    const delta = currentVol - lastVolumeH1;
-    lastVolumeH1 = currentVol;
+    const delta = currentVol - lastVolume[name];
+    lastVolume[name] = currentVol;
 
     if (delta >= MIN_USD) {
-      const txKey = `${Math.round(Date.now()/30000)}-${Math.round(delta)}`;
+      const txKey = `${name}-${Math.round(Date.now()/30000)}-${Math.round(delta)}`;
       if (!seenTxns.has(txKey)) {
         seenTxns.add(txKey);
         if (seenTxns.size > 2000) seenTxns.clear();
         const estDual = currentPrice > 0 ? delta / currentPrice : 0;
-        await sendAlert({ usd: delta, dualAmt: estDual, price: currentPrice, mcap, pairAddress, maker: null, txHash: null });
+        await sendAlert({ usd: delta, dualAmt: estDual, price: currentPrice, mcap, pairAddress, maker: null, txHash: null, explorer, label, chain: name });
       }
     }
   }
 }
 
-async function sendAlert({ usd, dualAmt, price, mcap, pairAddress, maker, txHash }) {
+async function sendAlert({ usd, dualAmt, price, mcap, pairAddress, maker, txHash, explorer, label, chain }) {
   const caption = [
-    `*DUAL Token Buy!*`,
+    `*DUAL Token Buy!* _[${label}]_`,
     butterflies(usd),
     ``,
     `💲 ${formatUsd(usd)} USDT`,
     `🔷 ~${formatDual(dualAmt)}`,
     `💵 Price $${price.toFixed(8)}`,
     mcap ? `📊 Market Cap ${formatUsd(mcap)}` : null,
-    maker ? `👤 [${shortAddr(maker)}](https://etherscan.io/address/${maker})` : null,
-    txHash ? `🔗 [View TX](https://etherscan.io/tx/${txHash})` : null,
+    maker ? `👤 [${shortAddr(maker)}](${explorer}/address/${maker})` : null,
+    txHash ? `🔗 [View TX](${explorer}/tx/${txHash})` : null,
     ``,
-    `[Chart](https://dexscreener.com/ethereum/${pairAddress}) · [Buy DUAL](https://app.uniswap.org/swap?outputCurrency=${DUAL_TOKEN})`,
+    `[Chart](https://dexscreener.com/${chain}/${pairAddress}) · [Buy DUAL](https://app.uniswap.org/swap?outputCurrency=${CHAINS.find(c=>c.name===chain)?.token})`,
   ].filter(Boolean).join("\n");
 
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`;
@@ -120,17 +132,22 @@ async function sendAlert({ usd, dualAmt, price, mcap, pairAddress, maker, txHash
   });
   const json = await res.json();
   if (!json.ok) console.error("Telegram error:", JSON.stringify(json));
-  else console.log(`✅ Alerted: ${formatUsd(usd)} buy`);
+  else console.log(`✅ Alerted: ${formatUsd(usd)} buy on ${label}`);
 }
 
 async function main() {
   if (!BOT_TOKEN) { console.error("❌  BOT_TOKEN not set."); process.exit(1); }
-  console.log("🦋  DUAL whale bot started — watching ETH buys ≥ $" + MIN_USD);
-  await processNewTrades();
-  setInterval(async () => {
-    try { await processNewTrades(); }
-    catch (err) { console.error("Poll error:", err.message); }
-  }, POLL_MS);
+  console.log("🦋  DUAL whale bot started — watching ETH + BASE buys ≥ $" + MIN_USD);
+
+  const run = async () => {
+    for (const chain of CHAINS) {
+      try { await processChain(chain); }
+      catch (err) { console.error(`[${chain.label}] Error:`, err.message); }
+    }
+  };
+
+  await run();
+  setInterval(run, POLL_MS);
 }
 
 main();
