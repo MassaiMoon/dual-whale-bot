@@ -2,7 +2,7 @@ import fetch from "node-fetch";
 
 const BOT_TOKEN      = process.env.BOT_TOKEN;
 const CHAT_IDS = ["-1003979928587", "-1002857896980"];
-const MIN_USD        = 800;
+const MIN_USD        = 1000;
 const POLL_MS        = 30_000;
 const HEADER_IMG = "AgACAgQAAxkBAAMLahsaxWL-qj5Rttn21HUd_pXCL9wAAoESaxtYctlQSq9wyE-vZM0BAAMCAAN5AAM7BA";
 
@@ -95,16 +95,19 @@ async function processChain({ name, token, explorer, label }) {
     }
 
     const delta = currentVol - lastVolume[name];
-    lastVolume[name] = currentVol;
 
     if (delta >= MIN_USD) {
-      const txKey = `${name}-${Math.round(Date.now()/30000)}-${Math.round(delta)}`;
+      // Use the new volume level as dedup key — same level won't alert twice
+      const txKey = `${name}-vol-${Math.round(currentVol)}`;
       if (!seenTxns.has(txKey)) {
         seenTxns.add(txKey);
         if (seenTxns.size > 2000) seenTxns.clear();
+        lastVolume[name] = currentVol;
         const estDual = currentPrice > 0 ? delta / currentPrice : 0;
         await sendAlert({ usd: delta, dualAmt: estDual, price: currentPrice, mcap, pairAddress, maker: null, txHash: null, explorer, label, chain: name });
       }
+    } else {
+      lastVolume[name] = currentVol;
     }
   }
 }
