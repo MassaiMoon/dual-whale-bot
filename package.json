@@ -6,6 +6,7 @@
     "start": "node dual-whale-bot.mjs"
   },
   "dependencies": {
+    "ethers": "^6.0.0",
     "node-fetch": "^3.3.2"
   }
 }
