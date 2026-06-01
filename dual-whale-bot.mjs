@@ -1,30 +1,30 @@
 import fetch from "node-fetch";
+import { createRequire } from "module";
+const require = createRequire(import.meta.url);
+const { ethers } = require("ethers");
 
-const BOT_TOKEN      = process.env.BOT_TOKEN;
-const CHAT_IDS = ["-1003979928587", "-1002857896980"];
-const MIN_USD        = 1500;
-const POLL_MS        = 30_000;
-const HEADER_IMG = "AgACAgQAAxkBAAMLahsaxWL-qj5Rttn21HUd_pXCL9wAAoESaxtYctlQSq9wyE-vZM0BAAMCAAN5AAM7BA";
+const BOT_TOKEN   = process.env.BOT_TOKEN;
+const ALCHEMY_KEY = process.env.ALCHEMY_KEY;
+const CHAT_IDS    = ["-1003979928587", "-1002857896980"];
+const MIN_USD     = 1000;
+const HEADER_IMG  = "AgACAgQAAxkBAAMLahsaxWL-qj5Rttn21HUd_pXCL9wAAoESaxtYctlQSq9wyE-vZM0BAAMCAAN5AAM7BA";
 
-const CHAINS = [
-  {
-    name:        "ethereum",
-    token:       "0x6aF487BEb661CCeCD1D045E9561A0dAC9AA5c7db",
-    explorer:    "https://etherscan.io",
-    label:       "ETH",
-  },
-  {
-    name:        "base",
-    token:       "0x832b55B0fA6397ca9e63B8c15DAdeF3f6E44614c",
-    explorer:    "https://basescan.org",
-    label:       "BASE",
-  },
+// DUAL/WETH Uniswap V3 pool on Ethereum (highest liquidity)
+const POOL_ADDRESS = "0xe395d0bad31e1f95d4209399efdcc1e221eb369d";
+const DUAL_TOKEN   = "0x6aF487BEb661CCeCD1D045E9561A0dAC9AA5c7db";
+const WETH_TOKEN   = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
+
+// Uniswap V3 pool ABI — only need Swap event
+const POOL_ABI = [
+  "event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)"
 ];
 
-const seenTxns    = new Set();
-const lastVolume  = {};  // keyed by chain name
-const lastAlerted = {};  // timestamp of last alert per chain
-const COOLDOWN_MS = 120_000; // 2 min cooldown between volume-delta alerts
+// ERC20 ABI for decimals
+const ERC20_ABI = ["function decimals() view returns (uint8)"];
+
+let dualDecimals = 18;
+let wethDecimals = 18;
+let ethPriceUsd  = 0;
 
 function butterflies(usd) {
   const count = Math.max(1, Math.round(usd / 100));
@@ -40,122 +40,115 @@ function formatDual(n) {
 }
 
 function shortAddr(addr) {
-  if (!addr) return null;
   return addr.slice(0, 6) + "..." + addr.slice(-4);
 }
 
-async function fetchPair(chain, token) {
-  const url = `https://api.dexscreener.com/token-pairs/v1/${chain}/${token}`;
-  const res  = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
-  if (!res.ok) throw new Error(`Dexscreener ${chain} HTTP ${res.status}`);
-  const data = await res.json();
-  if (!Array.isArray(data) || data.length === 0) return null;
-  return data.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
-}
-
-async function fetchTrades(chain, pairAddress) {
-  const url = `https://api.dexscreener.com/latest/dex/trades/${chain}/${pairAddress}`;
-  const res  = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
-  if (!res.ok) return [];
-  const data = await res.json();
-  return data.trades ?? [];
-}
-
-async function processChain({ name, token, explorer, label }) {
-  const pair = await fetchPair(name, token);
-  if (!pair) { console.log(`[${label}] No pair data`); return; }
-
-  const pairAddress  = pair.pairAddress;
-  const currentPrice = parseFloat(pair?.priceUsd ?? 0);
-  const mcap         = pair?.marketCap ?? pair?.fdv ?? 0;
-
-  const trades = await fetchTrades(name, pairAddress);
-
-  if (trades.length > 0) {
-    console.log(`[${label}] ${trades.length} trades, price: $${currentPrice.toFixed(8)}`);
-    for (const t of trades) {
-      if (t.type !== "buy") continue;
-      if (seenTxns.has(t.txHash)) continue;
-      const usd = parseFloat(t.volumeUsd ?? 0);
-      if (usd < MIN_USD) continue;
-
-      seenTxns.add(t.txHash);
-      if (seenTxns.size > 2000) seenTxns.clear();
-
-      const dualAmt = parseFloat(t.amount0 ?? 0);
-      await sendAlert({ usd, dualAmt, price: currentPrice, mcap, pairAddress, maker: t.maker, txHash: t.txHash, explorer, label, chain: name });
-    }
-  } else {
-    // Volume-delta fallback
-    const currentVol = parseFloat(pair?.volume?.h1 ?? 0);
-    console.log(`[${label}] vol H1: $${currentVol.toFixed(0)}, price: $${currentPrice.toFixed(8)}`);
-
-    if (lastVolume[name] === undefined) {
-      lastVolume[name] = currentVol;
-      console.log(`[${label}] Baseline set ✅`);
-      return;
-    }
-
-    const delta = currentVol - lastVolume[name];
-
-    if (delta >= MIN_USD) {
-      const now = Date.now();
-      const lastAlert = lastAlerted[name] ?? 0;
-      if (now - lastAlert >= COOLDOWN_MS) {
-        lastAlerted[name] = now;
-        lastVolume[name] = currentVol;
-        const estDual = currentPrice > 0 ? delta / currentPrice : 0;
-        await sendAlert({ usd: delta, dualAmt: estDual, price: currentPrice, mcap, pairAddress, maker: null, txHash: null, explorer, label, chain: name });
-      } else {
-        console.log(`[${label}] Cooldown active, skipping duplicate alert`);
-      }
-    } else {
-      lastVolume[name] = currentVol;
-    }
+async function getEthPrice() {
+  try {
+    const res  = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd");
+    const data = await res.json();
+    ethPriceUsd = data?.ethereum?.usd ?? ethPriceUsd;
+    console.log(`ETH price updated: $${ethPriceUsd}`);
+  } catch (e) {
+    console.error("ETH price fetch error:", e.message);
   }
 }
 
-async function sendAlert({ usd, dualAmt, price, mcap, pairAddress, maker, txHash, explorer, label, chain }) {
+async function sendAlert({ usd, dualAmt, pricePerDual, maker, txHash }) {
   const caption = [
-    `*DUAL Token Buy!* _[${label}]_`,
+    `*DUAL Token Buy! 🟢*`,
     butterflies(usd),
     ``,
     `💲 ${formatUsd(usd)} USDT`,
-    `🔷 ~${formatDual(dualAmt)}`,
-    `💵 Price $${price.toFixed(8)}`,
-    mcap ? `📊 Market Cap ${formatUsd(mcap)}` : null,
-    maker ? `👤 [${shortAddr(maker)}](${explorer}/address/${maker})` : null,
-    txHash ? `🔗 [View TX](${explorer}/tx/${txHash})` : null,
+    `🔷 ${formatDual(dualAmt)}`,
+    `💵 Price $${pricePerDual.toFixed(8)}`,
+    `👤 [${shortAddr(maker)}](https://etherscan.io/address/${maker})`,
+    `🔗 [View TX](https://etherscan.io/tx/${txHash})`,
     ``,
-    `[Chart](https://dexscreener.com/${chain}/${pairAddress}) · [Buy DUAL](https://app.uniswap.org/swap?outputCurrency=${CHAINS.find(c=>c.name===chain)?.token})`,
+    `[Chart](https://dexscreener.com/ethereum/${POOL_ADDRESS}) · [Buy DUAL](https://app.uniswap.org/swap?outputCurrency=${DUAL_TOKEN})`,
   ].filter(Boolean).join("\n");
 
   for (const chatId of CHAT_IDS) {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`;
     const res  = await fetch(url, {
-      method: "POST",
+      method:  "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, photo: HEADER_IMG, caption, parse_mode: "Markdown", disable_web_page_preview: true }),
+      body:    JSON.stringify({ chat_id: chatId, photo: HEADER_IMG, caption, parse_mode: "Markdown", disable_web_page_preview: true }),
     });
     const json = await res.json();
     if (!json.ok) console.error(`Telegram error (${chatId}):`, JSON.stringify(json));
-    else console.log(`✅ Alerted: ${formatUsd(usd)} buy on ${label} -> ${chatId}`);
+    else console.log(`✅ Sent to ${chatId}`);
   }
 }
 
 async function main() {
-  if (!BOT_TOKEN) { console.error("❌  BOT_TOKEN not set."); process.exit(1); }
-  console.log("🦋  DUAL whale bot started — watching ETH + BASE buys ≥ $" + MIN_USD);
+  if (!BOT_TOKEN)   { console.error("❌ BOT_TOKEN not set");   process.exit(1); }
+  if (!ALCHEMY_KEY) { console.error("❌ ALCHEMY_KEY not set"); process.exit(1); }
 
-  const run = async () => {
-    for (const chain of CHAINS) {
-      try { await processChain(chain); }
-      catch (err) { console.error(`[${chain.label}] Error:`, err.message); }
+  // Get ETH price and refresh every 5 minutes
+  await getEthPrice();
+  setInterval(getEthPrice, 5 * 60 * 1000);
+
+  const provider = new ethers.WebSocketProvider(
+    `wss://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`
+  );
+
+  // Get token decimals
+  const dualContract = new ethers.Contract(DUAL_TOKEN, ERC20_ABI, provider);
+  const wethContract = new ethers.Contract(WETH_TOKEN, ERC20_ABI, provider);
+  dualDecimals = await dualContract.decimals();
+  wethDecimals = await wethContract.decimals();
+  console.log(`DUAL decimals: ${dualDecimals}, WETH decimals: ${wethDecimals}`);
+
+  const pool = new ethers.Contract(POOL_ADDRESS, POOL_ABI, provider);
+
+  console.log(`🦋 DUAL whale bot started — listening for buys ≥ $${MIN_USD} on Ethereum`);
+
+  pool.on("Swap", async (sender, recipient, amount0, amount1, sqrtPriceX96, liquidity, tick, event) => {
+    try {
+      // In DUAL/WETH pool:
+      // amount0 = DUAL (token0), amount1 = WETH (token1)
+      // A BUY of DUAL = amount0 is POSITIVE (DUAL leaving pool to buyer)
+      // Wait — in Uniswap V3: negative amount = token leaving pool (received by user)
+      // So amount0 < 0 means DUAL is leaving pool = user is BUYING DUAL
+
+      const dualRaw = BigInt(amount0.toString());
+      const wethRaw = BigInt(amount1.toString());
+
+      const isBuy = dualRaw < 0n; // DUAL leaving pool = buy
+      if (!isBuy) return;
+
+      const dualAmt     = Number(-dualRaw) / 10 ** Number(dualDecimals);
+      const wethAmt     = Number(wethRaw)  / 10 ** Number(wethDecimals);
+      const usdValue    = wethAmt * ethPriceUsd;
+      const pricePerDual = usdValue / dualAmt;
+
+      if (usdValue < MIN_USD) return;
+
+      const txHash = event.log.transactionHash;
+      const maker  = recipient; // buyer receives DUAL
+
+      console.log(`🔔 Buy detected: ${formatDual(dualAmt)} for ${formatUsd(usdValue)} | tx: ${txHash.slice(0,10)}...`);
+
+      await sendAlert({ usd: usdValue, dualAmt, pricePerDual, maker, txHash });
+
+    } catch (err) {
+      console.error("Swap handler error:", err.message);
     }
-  };
+  });
 
-  await run();
-  setInterval(run, POLL_MS);
+  // Keep WebSocket alive with ping
+  setInterval(() => {
+    provider.getBlockNumber().then(b => console.log(`Block: ${b}`)).catch(e => {
+      console.error("Provider ping failed:", e.message);
+      process.exit(1); // Railway will auto-restart
+    });
+  }, 30_000);
+
+  provider.on("error", (err) => {
+    console.error("Provider error:", err.message);
+    process.exit(1);
+  });
 }
 
 main();
