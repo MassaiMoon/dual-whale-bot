@@ -101,18 +101,18 @@ async function main() {
       // Only process our pool
       if (id.toLowerCase() !== DUAL_POOL_ID.toLowerCase()) return;
 
-      // In V4 DUAL/WETH pool:
-      // amount0 = DUAL, amount1 = WETH
+      // In V4 WETH/DUAL pool:
+      // amount0 = WETH (token0), amount1 = DUAL (token1)
       // Negative amount = token leaving pool (received by user)
-      // amount0 < 0 means DUAL leaving pool = user BUYING DUAL
-      const dualRaw = BigInt(amount0.toString());
-      const wethRaw = BigInt(amount1.toString());
+      // amount1 < 0 means DUAL leaving pool = user BUYING DUAL
+      const wethRaw = BigInt(amount0.toString());
+      const dualRaw = BigInt(amount1.toString());
 
       const isBuy = dualRaw < 0n;
       if (!isBuy) return;
 
       const dualAmt    = Number(-dualRaw) / 10 ** DUAL_DECIMALS;
-      const wethAmt    = Number(wethRaw)  / 10 ** WETH_DECIMALS;
+      const wethAmt    = Number(-wethRaw) / 10 ** WETH_DECIMALS;
       const usdValue   = wethAmt * ethPriceUsd;
       const pricePerDual = dualAmt > 0 ? usdValue / dualAmt : 0;
 
@@ -143,3 +143,4 @@ async function main() {
 }
 
 main();
+
