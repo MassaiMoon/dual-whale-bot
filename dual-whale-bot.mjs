@@ -1,4 +1,4 @@
-// v2
+// v3
 import fetch from "node-fetch";
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
@@ -10,22 +10,22 @@ const CHAT_IDS    = ["-1003979928587", "-1002857896980"];
 const MIN_USD     = 10;
 const HEADER_IMG  = "AgACAgQAAxkBAAMLahsaxWL-qj5Rttn21HUd_pXCL9wAAoESaxtYctlQSq9wyE-vZM0BAAMCAAN5AAM7BA";
 
-// DUAL/WETH Uniswap V3 pool on Ethereum (highest liquidity)
-const POOL_ADDRESS = "0xe395d0bad31e1f95d4209399efdcc1e221eb369d";
-const DUAL_TOKEN   = "0x6aF487BEb661CCeCD1D045E9561A0dAC9AA5c7db";
-const WETH_TOKEN   = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
+const DUAL_TOKEN    = "0x6aF487BEb661CCeCD1D045E9561A0dAC9AA5c7db".toLowerCase();
+const WETH_TOKEN    = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".toLowerCase();
+const POOL_MANAGER  = "0x000000000004444c5dc75cB358380D2e3dE08A90"; // Uniswap V4 PoolManager
 
-// Uniswap V3 pool ABI — only need Swap event
-const POOL_ABI = [
-  "event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)"
+// V4 Swap event — emitted by PoolManager
+const POOL_MANAGER_ABI = [
+  "event Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)"
 ];
 
-// ERC20 ABI for decimals
-const ERC20_ABI = ["function decimals() view returns (uint8)"];
+// The V4 pool ID for DUAL/WETH
+const DUAL_POOL_ID = "0xe395d0bad31e1f95d4209399efdcc1e221eb369d0be7782fb7704d9a9d5f08c8";
 
-let dualDecimals = 18;
-let wethDecimals = 18;
-let ethPriceUsd  = 0;
+const DUAL_DECIMALS = 18;
+const WETH_DECIMALS = 18;
+
+let ethPriceUsd = 2000;
 
 function butterflies(usd) {
   const count = Math.max(1, Math.round(usd / 100));
@@ -55,7 +55,7 @@ async function getEthPrice() {
   }
 }
 
-async function sendAlert({ usd, dualAmt, pricePerDual, maker, txHash }) {
+async function sendAlert({ usd, dualAmt, pricePerDual, sender, txHash }) {
   const caption = [
     `*DUAL Token Buy! 🟢*`,
     butterflies(usd),
@@ -63,22 +63,21 @@ async function sendAlert({ usd, dualAmt, pricePerDual, maker, txHash }) {
     `💲 ${formatUsd(usd)} USDT`,
     `🔷 ${formatDual(dualAmt)}`,
     `💵 Price $${pricePerDual.toFixed(8)}`,
-    `👤 [${shortAddr(maker)}](https://etherscan.io/address/${maker})`,
+    `👤 [${shortAddr(sender)}](https://etherscan.io/address/${sender})`,
     `🔗 [View TX](https://etherscan.io/tx/${txHash})`,
     ``,
-    `[Chart](https://dexscreener.com/ethereum/${POOL_ADDRESS}) · [Buy DUAL](https://app.uniswap.org/swap?outputCurrency=${DUAL_TOKEN})`,
-  ].filter(Boolean).join("\n");
+    `[Chart](https://dexscreener.com/ethereum/${DUAL_POOL_ID}) · [Buy DUAL](https://app.uniswap.org/swap?outputCurrency=${DUAL_TOKEN})`,
+  ].join("\n");
 
   for (const chatId of CHAT_IDS) {
-    const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`;
-    const res  = await fetch(url, {
+    const res  = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
       method:  "POST",
       headers: { "Content-Type": "application/json" },
       body:    JSON.stringify({ chat_id: chatId, photo: HEADER_IMG, caption, parse_mode: "Markdown", disable_web_page_preview: true }),
     });
     const json = await res.json();
     if (!json.ok) console.error(`Telegram error (${chatId}):`, JSON.stringify(json));
-    else console.log(`✅ Sent to ${chatId}`);
+    else console.log(`✅ Sent to ${chatId}: ${formatUsd(usd)} buy`);
   }
 }
 
@@ -86,7 +85,6 @@ async function main() {
   if (!BOT_TOKEN)   { console.error("❌ BOT_TOKEN not set");   process.exit(1); }
   if (!ALCHEMY_KEY) { console.error("❌ ALCHEMY_KEY not set"); process.exit(1); }
 
-  // Get ETH price and refresh every 5 minutes
   await getEthPrice();
   setInterval(getEthPrice, 5 * 60 * 1000);
 
@@ -94,56 +92,48 @@ async function main() {
     `wss://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`
   );
 
-  // Get token decimals
-  const dualContract = new ethers.Contract(DUAL_TOKEN, ERC20_ABI, provider);
-  const wethContract = new ethers.Contract(WETH_TOKEN, ERC20_ABI, provider);
-  dualDecimals = await dualContract.decimals();
-  wethDecimals = await wethContract.decimals();
-  console.log(`DUAL decimals: ${dualDecimals}, WETH decimals: ${wethDecimals}`);
+  const poolManager = new ethers.Contract(POOL_MANAGER, POOL_MANAGER_ABI, provider);
 
-  const pool = new ethers.Contract(POOL_ADDRESS, POOL_ABI, provider);
+  console.log(`🦋 DUAL whale bot started — listening to Uniswap V4 PoolManager for DUAL buys ≥ $${MIN_USD}`);
 
-  console.log(`🦋 DUAL whale bot started — listening for buys ≥ $${MIN_USD} on Ethereum`);
-
-  pool.on("Swap", async (sender, recipient, amount0, amount1, sqrtPriceX96, liquidity, tick, event) => {
+  poolManager.on("Swap", async (id, sender, amount0, amount1, sqrtPriceX96, liquidity, tick, fee, event) => {
     try {
-      // In DUAL/WETH pool:
-      // amount0 = DUAL (token0), amount1 = WETH (token1)
-      // A BUY of DUAL = amount0 is POSITIVE (DUAL leaving pool to buyer)
-      // Wait — in Uniswap V3: negative amount = token leaving pool (received by user)
-      // So amount0 < 0 means DUAL is leaving pool = user is BUYING DUAL
+      // Only process our pool
+      if (id.toLowerCase() !== DUAL_POOL_ID.toLowerCase()) return;
 
+      // In V4 DUAL/WETH pool:
+      // amount0 = DUAL, amount1 = WETH
+      // Negative amount = token leaving pool (received by user)
+      // amount0 < 0 means DUAL leaving pool = user BUYING DUAL
       const dualRaw = BigInt(amount0.toString());
       const wethRaw = BigInt(amount1.toString());
 
-      const isBuy = dualRaw < 0n; // DUAL leaving pool = buy
+      const isBuy = dualRaw < 0n;
       if (!isBuy) return;
 
-      const dualAmt     = Number(-dualRaw) / 10 ** Number(dualDecimals);
-      const wethAmt     = Number(wethRaw)  / 10 ** Number(wethDecimals);
-      const usdValue    = wethAmt * ethPriceUsd;
-      const pricePerDual = usdValue / dualAmt;
+      const dualAmt    = Number(-dualRaw) / 10 ** DUAL_DECIMALS;
+      const wethAmt    = Number(wethRaw)  / 10 ** WETH_DECIMALS;
+      const usdValue   = wethAmt * ethPriceUsd;
+      const pricePerDual = dualAmt > 0 ? usdValue / dualAmt : 0;
 
       if (usdValue < MIN_USD) return;
 
       const txHash = event.log.transactionHash;
-      const maker  = recipient; // buyer receives DUAL
 
-      console.log(`🔔 Buy detected: ${formatDual(dualAmt)} for ${formatUsd(usdValue)} | tx: ${txHash.slice(0,10)}...`);
+      console.log(`🔔 Buy: ${formatDual(dualAmt)} for ${formatUsd(usdValue)} | tx: ${txHash.slice(0,10)}...`);
 
-      await sendAlert({ usd: usdValue, dualAmt, pricePerDual, maker, txHash });
+      await sendAlert({ usd: usdValue, dualAmt, pricePerDual, sender, txHash });
 
     } catch (err) {
       console.error("Swap handler error:", err.message);
     }
   });
 
-  // Keep WebSocket alive with ping
+  // Keep WebSocket alive
   setInterval(() => {
-    provider.getBlockNumber().then(b => console.log(`Block: ${b}`)).catch(e => {
-      console.error("Provider ping failed:", e.message);
-      process.exit(1); // Railway will auto-restart
-    });
+    provider.getBlockNumber()
+      .then(b => console.log(`Block: ${b}`))
+      .catch(e => { console.error("Provider ping failed:", e.message); process.exit(1); });
   }, 30_000);
 
   provider.on("error", (err) => {
