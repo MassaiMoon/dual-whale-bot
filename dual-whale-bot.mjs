@@ -2,7 +2,7 @@ import fetch from "node-fetch";
 
 const BOT_TOKEN      = process.env.BOT_TOKEN;
 const CHAT_IDS = ["-1003979928587", "-1002857896980"];
-const MIN_USD        = 1000;
+const MIN_USD        = 1500;
 const POLL_MS        = 30_000;
 const HEADER_IMG = "AgACAgQAAxkBAAMLahsaxWL-qj5Rttn21HUd_pXCL9wAAoESaxtYctlQSq9wyE-vZM0BAAMCAAN5AAM7BA";
 
@@ -21,8 +21,10 @@ const CHAINS = [
   },
 ];
 
-const seenTxns   = new Set();
-const lastVolume = {};  // keyed by chain name
+const seenTxns    = new Set();
+const lastVolume  = {};  // keyed by chain name
+const lastAlerted = {};  // timestamp of last alert per chain
+const COOLDOWN_MS = 120_000; // 2 min cooldown between volume-delta alerts
 
 function butterflies(usd) {
   const count = Math.max(1, Math.round(usd / 100));
@@ -97,14 +99,15 @@ async function processChain({ name, token, explorer, label }) {
     const delta = currentVol - lastVolume[name];
 
     if (delta >= MIN_USD) {
-      // Use the new volume level as dedup key — same level won't alert twice
-      const txKey = `${name}-vol-${Math.round(currentVol)}`;
-      if (!seenTxns.has(txKey)) {
-        seenTxns.add(txKey);
-        if (seenTxns.size > 2000) seenTxns.clear();
+      const now = Date.now();
+      const lastAlert = lastAlerted[name] ?? 0;
+      if (now - lastAlert >= COOLDOWN_MS) {
+        lastAlerted[name] = now;
         lastVolume[name] = currentVol;
         const estDual = currentPrice > 0 ? delta / currentPrice : 0;
         await sendAlert({ usd: delta, dualAmt: estDual, price: currentPrice, mcap, pairAddress, maker: null, txHash: null, explorer, label, chain: name });
+      } else {
+        console.log(`[${label}] Cooldown active, skipping duplicate alert`);
       }
     } else {
       lastVolume[name] = currentVol;
