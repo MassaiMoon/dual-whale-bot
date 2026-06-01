@@ -7,7 +7,7 @@ const { ethers } = require("ethers");
 const BOT_TOKEN   = process.env.BOT_TOKEN;
 const ALCHEMY_KEY = process.env.ALCHEMY_KEY;
 const CHAT_IDS    = ["-1003979928587", "-1002857896980"];
-const MIN_USD     = 100;
+const MIN_USD     = 10;
 const HEADER_IMG  = "AgACAgQAAxkBAAMLahsaxWL-qj5Rttn21HUd_pXCL9wAAoESaxtYctlQSq9wyE-vZM0BAAMCAAN5AAM7BA";
 
 // DUAL/WETH Uniswap V3 pool on Ethereum (highest liquidity)
