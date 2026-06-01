@@ -1,3 +1,4 @@
+// v2
 import fetch from "node-fetch";
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
