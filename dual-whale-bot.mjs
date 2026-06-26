@@ -88,7 +88,7 @@ async function main() {
   setInterval(getEthPrice, 5 * 60 * 1000);
 
   const provider = new ethers.WebSocketProvider(
-    `wss://mainnet.infura.io/ws/v3/${INFURA_KEY}`
+    `wss://ethereum-mainnet.infura.io/ws/v3/${INFURA_KEY}`
   );
 
   const poolManager = new ethers.Contract(POOL_MANAGER, POOL_MANAGER_ABI, provider);
