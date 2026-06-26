@@ -5,7 +5,7 @@ const require = createRequire(import.meta.url);
 const { ethers } = require("ethers");
 
 const BOT_TOKEN   = process.env.BOT_TOKEN;
-const INFURA_KEY  = process.env.INFURA_KEY;
+const QUICKNODE_URL = process.env.QUICKNODE_URL;
 const CHAT_IDS    = ["-1003979928587", "-1002857896980"];
 const MIN_USD     = 400;
 const HEADER_IMG  = "AgACAgQAAxkBAAMLahsaxWL-qj5Rttn21HUd_pXCL9wAAoESaxtYctlQSq9wyE-vZM0BAAMCAAN5AAM7BA";
@@ -82,13 +82,13 @@ async function sendAlert({ usd, dualAmt, pricePerDual, sender, txHash }) {
 
 async function main() {
   if (!BOT_TOKEN)   { console.error("❌ BOT_TOKEN not set");   process.exit(1); }
-  if (!INFURA_KEY)  { console.error("❌ INFURA_KEY not set");  process.exit(1); }
+  if (!QUICKNODE_URL) { console.error("❌ QUICKNODE_URL not set"); process.exit(1); }
 
   await getEthPrice();
   setInterval(getEthPrice, 5 * 60 * 1000);
 
   const provider = new ethers.WebSocketProvider(
-    `wss://mainnet.infura.io/ws/v3/${INFURA_KEY}`
+    QUICKNODE_URL
   );
 
   const poolManager = new ethers.Contract(POOL_MANAGER, POOL_MANAGER_ABI, provider);
