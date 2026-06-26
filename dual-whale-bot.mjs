@@ -5,7 +5,7 @@ const require = createRequire(import.meta.url);
 const { ethers } = require("ethers");
 
 const BOT_TOKEN   = process.env.BOT_TOKEN;
-const ALCHEMY_KEY = process.env.ALCHEMY_KEY;
+const INFURA_KEY  = process.env.INFURA_KEY;
 const CHAT_IDS    = ["-1003979928587", "-1002857896980"];
 const MIN_USD     = 400;
 const HEADER_IMG  = "AgACAgQAAxkBAAMLahsaxWL-qj5Rttn21HUd_pXCL9wAAoESaxtYctlQSq9wyE-vZM0BAAMCAAN5AAM7BA";
@@ -82,13 +82,13 @@ async function sendAlert({ usd, dualAmt, pricePerDual, sender, txHash }) {
 
 async function main() {
   if (!BOT_TOKEN)   { console.error("❌ BOT_TOKEN not set");   process.exit(1); }
-  if (!ALCHEMY_KEY) { console.error("❌ ALCHEMY_KEY not set"); process.exit(1); }
+  if (!INFURA_KEY)  { console.error("❌ INFURA_KEY not set");  process.exit(1); }
 
   await getEthPrice();
   setInterval(getEthPrice, 5 * 60 * 1000);
 
   const provider = new ethers.WebSocketProvider(
-    `wss://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`
+    `wss://mainnet.infura.io/ws/v3/${INFURA_KEY}`
   );
 
   const poolManager = new ethers.Contract(POOL_MANAGER, POOL_MANAGER_ABI, provider);
