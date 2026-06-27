@@ -5,9 +5,9 @@ const require = createRequire(import.meta.url);
 const { ethers } = require("ethers");
 
 const BOT_TOKEN   = process.env.BOT_TOKEN;
-const QUICKNODE_URL = process.env.QUICKNODE_URL;
+const ALCHEMY_KEY  = process.env.ALCHEMY_KEY;
 const CHAT_IDS    = ["-1003979928587", "-1002857896980"];
-const MIN_USD     = 400;
+const MIN_USD     = 600;
 const HEADER_IMG  = "AgACAgQAAxkBAAMLahsaxWL-qj5Rttn21HUd_pXCL9wAAoESaxtYctlQSq9wyE-vZM0BAAMCAAN5AAM7BA";
 
 const DUAL_TOKEN   = "0x6aF487BEb661CCeCD1D045E9561A0dAC9AA5c7db";
@@ -82,13 +82,13 @@ async function sendAlert({ usd, dualAmt, pricePerDual, sender, txHash }) {
 
 async function main() {
   if (!BOT_TOKEN)   { console.error("❌ BOT_TOKEN not set");   process.exit(1); }
-  if (!QUICKNODE_URL) { console.error("❌ QUICKNODE_URL not set"); process.exit(1); }
+  if (!ALCHEMY_KEY)  { console.error("❌ ALCHEMY_KEY not set");  process.exit(1); }
 
   await getEthPrice();
   setInterval(getEthPrice, 5 * 60 * 1000);
 
   const provider = new ethers.WebSocketProvider(
-    QUICKNODE_URL
+    `wss://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`
   );
 
   const poolManager = new ethers.Contract(POOL_MANAGER, POOL_MANAGER_ABI, provider);
