@@ -1,9 +1,11 @@
-// v6 - correct buy direction, pool-filtered subscription, real buyer, safe price, no crash loop
+// v7 - tracks the Uniswap V3 DUAL/WETH pool (most liquidity), real buyer, safe price, no crash loop
 //
-// Uniswap V4 Swap amounts are from the SWAPPER's point of view (V3 was the pool's):
-//   negative = the swapper paid that token in, positive = the swapper received it.
-// So a DUAL buy is amount1 > 0 (swapper receives DUAL) and amount0 < 0 (swapper pays ETH).
-// Verified on-chain 2026-11-25 against tick direction and DUAL Transfer logs.
+// Uniswap V3 Swap amounts are from the POOL's point of view:
+//   negative = left the pool (sent to the trader), positive = entered the pool.
+// token0 = DUAL, token1 = WETH, so a DUAL buy is amount0 < 0 (DUAL out) and amount1 > 0 (WETH in).
+// Verified on-chain 2026-11-25 against DUAL Transfer logs.
+// (The old V4 pool 0xe395d0bad31e1f95d4209399efdcc1e221eb369d0be7782fb7704d9a9d5f08c8 used the
+//  opposite, swapper-side convention. It is no longer tracked: ~$20K liquidity.)
 import fetch from "node-fetch";
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
@@ -23,17 +25,16 @@ const DRY_RUN_TX    = process.env.DRY_RUN_TX || "";
 const RPC_URL       = process.env.RPC_URL || "";
 
 // ---------- on-chain constants ----------
-const POOL_MANAGER  = "0x000000000004444c5dc75cB358380D2e3dE08A90";
-const DUAL_POOL_ID  = "0xe395d0bad31e1f95d4209399efdcc1e221eb369d0be7782fb7704d9a9d5f08c8";
+const DUAL_POOL     = "0xA7C65b7B4b73a6CBbb998148f224bbEb2f49Ca87"; // Uniswap V3 DUAL/WETH 1%
 const DUAL_TOKEN    = "0x6aF487BEb661CCeCD1D045E9561A0dAC9AA5c7db";
 
 const SWAP_IFACE = new ethers.Interface([
-  "event Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)",
+  "event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)",
 ]);
 const SWAP_TOPIC     = SWAP_IFACE.getEvent("Swap").topicHash;
 const TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)");
-// Only this pool's swaps are delivered (topic filter), not every V4 swap on Ethereum.
-const SWAP_FILTER    = { address: POOL_MANAGER, topics: [SWAP_TOPIC, DUAL_POOL_ID] };
+// Only this pool's swaps are delivered.
+const SWAP_FILTER    = { address: DUAL_POOL, topics: [SWAP_TOPIC] };
 
 const PRICE_MAX_AGE_MS = 30 * 60 * 1000;   // don't post with an ETH price older than 30 min
 
@@ -114,7 +115,7 @@ function buildCaption({ usd, dualAmt, pricePerDual, buyer, txHash }) {
     `👤 [${shortAddr(buyer)}](https://etherscan.io/address/${buyer})`,
     `🔗 [View TX](https://etherscan.io/tx/${txHash})`,
     ``,
-    `[Chart](https://dexscreener.com/ethereum/${DUAL_POOL_ID}) · [Buy DUAL](https://app.uniswap.org/swap?outputCurrency=${DUAL_TOKEN})`,
+    `[Chart](https://dexscreener.com/ethereum/${DUAL_POOL}) · [Buy DUAL](https://app.uniswap.org/swap?outputCurrency=${DUAL_TOKEN})`,
   ].join("\n");
 }
 
@@ -146,7 +147,7 @@ async function findBuyer(provider, txHash, fallback) {
       net.set(from, (net.get(from) ?? 0n) - v);
       net.set(to,   (net.get(to)   ?? 0n) + v);
     }
-    net.delete(ethers.getAddress(POOL_MANAGER));
+    net.delete(ethers.getAddress(DUAL_POOL));
     let best = null, bestAmt = 0n;
     for (const [addr, amt] of net) if (amt > bestAmt) { best = addr; bestAmt = amt; }
     return best ?? rc.from ?? fallback;
@@ -161,13 +162,13 @@ async function handleSwapLog(log, provider, startBlock) {
   try {
     if (log.removed) return;                                   // reorged out
     if (startBlock !== undefined && log.blockNumber < startBlock) return;
-    if (log.topics[1]?.toLowerCase() !== DUAL_POOL_ID) return; // belt and braces
+    if (log.address.toLowerCase() !== DUAL_POOL.toLowerCase()) return; // belt and braces
     if (seenTxns.has(log.transactionHash)) return;
 
     const ev      = SWAP_IFACE.parseLog(log);
-    const amount0 = BigInt(ev.args.amount0);   // ETH  (swapper view)
-    const amount1 = BigInt(ev.args.amount1);   // DUAL (swapper view)
-    const isBuy   = amount1 > 0n && amount0 < 0n;
+    const amount0 = BigInt(ev.args.amount0);   // DUAL (pool view)
+    const amount1 = BigInt(ev.args.amount1);   // WETH (pool view)
+    const isBuy   = amount0 < 0n && amount1 > 0n;
     if (!isBuy) return;
     rememberTx(log.transactionHash);
 
@@ -176,8 +177,8 @@ async function handleSwapLog(log, provider, startBlock) {
       return;
     }
 
-    const dualAmt      = Number(amount1) / 1e18;
-    const ethAmt       = Number(-amount0) / 1e18;
+    const dualAmt      = Number(-amount0) / 1e18;
+    const ethAmt       = Number(amount1) / 1e18;
     const usd          = ethAmt * ethPriceUsd;
     const pricePerDual = dualAmt > 0 ? usd / dualAmt : 0;
 
@@ -222,7 +223,7 @@ async function connect() {
     provider.on("error", e => fail("provider error: " + (e?.message || e)));
 
     const startBlock = await provider.getBlockNumber();
-    console.log(`✅ Connected. Start block: ${startBlock}. Watching pool ${DUAL_POOL_ID}`);
+    console.log(`✅ Connected. Start block: ${startBlock}. Watching pool ${DUAL_POOL}`);
     reconnectDelay = 5000;
 
     await provider.on(SWAP_FILTER, log => handleSwapLog(log, provider, startBlock));
@@ -253,12 +254,11 @@ async function dryRun() {
   await getEthPrice();
   for (const hash of DRY_RUN_TX.split(",").map(s => s.trim()).filter(Boolean)) {
     const rc = await provider.getTransactionReceipt(hash);
-    const logs = rc.logs.filter(l => l.address.toLowerCase() === POOL_MANAGER.toLowerCase() && l.topics[0] === SWAP_TOPIC);
-    console.log(`\n${hash}: ${logs.length} Swap log(s) in DUAL/ETH pool candidates`);
+    const logs = rc.logs.filter(l => l.address.toLowerCase() === DUAL_POOL.toLowerCase() && l.topics[0] === SWAP_TOPIC);
+    console.log(`\n${hash}: ${logs.length} Swap log(s) in the DUAL/WETH V3 pool`);
     for (const l of logs) {
-      if (l.topics[1].toLowerCase() !== DUAL_POOL_ID) continue;
       const ev = SWAP_IFACE.parseLog(l);
-      console.log(`  amount0(ETH)=${ethers.formatEther(ev.args.amount0)} amount1(DUAL)=${ethers.formatEther(ev.args.amount1)} → ${BigInt(ev.args.amount1) > 0n ? "BUY" : "SELL (ignored)"}`);
+      console.log(`  amount0(DUAL)=${ethers.formatEther(ev.args.amount0)} amount1(WETH)=${ethers.formatEther(ev.args.amount1)} → ${BigInt(ev.args.amount0) < 0n ? "BUY" : "SELL (ignored)"}`);
       await handleSwapLog(l, provider, undefined);
     }
   }
@@ -278,12 +278,12 @@ async function main() {
     return;
   }
 
-  console.log(`🦋 DUAL whale bot v6 — buys ≥ $${MIN_USD} → ${CHAT_IDS.length} chat(s)`);
+  console.log(`🦋 DUAL whale bot v7 — buys ≥ $${MIN_USD} → ${CHAT_IDS.length} chat(s)`);
   await getEthPrice();
   setInterval(getEthPrice, 5 * 60 * 1000);
 
   if (ADMIN_CHAT_ID) {
-    tg("sendMessage", { chat_id: ADMIN_CHAT_ID, text: `🦋 DUAL whale bot v6 started. Min $${MIN_USD}, ${CHAT_IDS.length} chat(s).` })
+    tg("sendMessage", { chat_id: ADMIN_CHAT_ID, text: `🦋 DUAL whale bot v7 started. Min $${MIN_USD}, ${CHAT_IDS.length} chat(s).` })
       .catch(e => console.error("Admin notice failed:", e.message));
   }
 
