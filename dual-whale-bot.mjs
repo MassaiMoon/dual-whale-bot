@@ -1,4 +1,7 @@
-// v7 - tracks the Uniswap V3 DUAL/WETH pool (most liquidity), real buyer, safe price, no crash loop
+// v8 - Uniswap V3 DUAL/WETH pool + Kraken DUAL/USD and DUAL/EUR buys
+//
+// Kraken: public WebSocket v2 trade feed (no API key, no Alchemy cost). Fills from one taker
+// order share a timestamp, so they are summed into one buy. No wallet/tx exists for CEX trades.
 //
 // Uniswap V3 Swap amounts are from the POOL's point of view:
 //   negative = left the pool (sent to the trader), positive = entered the pool.
@@ -20,9 +23,16 @@ const MIN_USD       = Number(process.env.MIN_USD || 450);
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || "";   // optional: private chat for startup notice
 const HEADER_IMG    = "AgACAgQAAxkBAAMLahsaxWL-qj5Rttn21HUd_pXCL9wAAoESaxtYctlQSq9wyE-vZM0BAAMCAAN5AAM7BA";
 
+// Kraken: set KRAKEN_PAIRS="" to switch it off. KRAKEN_MIN_USD defaults to MIN_USD.
+const KRAKEN_PAIRS  = (process.env.KRAKEN_PAIRS ?? "DUAL/USD,DUAL/EUR").split(",").map(s => s.trim()).filter(Boolean);
+const KRAKEN_MIN_USD = Number(process.env.KRAKEN_MIN_USD || MIN_USD);
+
 // Replay mode for testing without posting: DRY_RUN_TX=0xhash1,0xhash2  RPC_URL=https://...
 const DRY_RUN_TX    = process.env.DRY_RUN_TX || "";
 const RPC_URL       = process.env.RPC_URL || "";
+// Kraken test without posting: DRY_RUN_KRAKEN=1 replays Kraken's last trades as if they were live.
+const DRY_RUN_KRAKEN = process.env.DRY_RUN_KRAKEN || "";
+const DRY_RUN       = Boolean(DRY_RUN_TX || DRY_RUN_KRAKEN);
 
 // ---------- on-chain constants ----------
 const DUAL_POOL     = "0xA7C65b7B4b73a6CBbb998148f224bbEb2f49Ca87"; // Uniswap V3 DUAL/WETH 1%
@@ -90,6 +100,21 @@ async function getEthPrice() {
 
 const priceIsFresh = () => ethPriceUsd !== null && Date.now() - ethPriceAt < PRICE_MAX_AGE_MS;
 
+// ---------- EUR→USD for Kraken DUAL/EUR (Kraken's own EUR/USD ticker) ----------
+let eurUsd   = null;
+let eurUsdAt = 0;
+async function getEurUsd() {
+  try {
+    const j = await getJson("https://api.kraken.com/0/public/Ticker?pair=EURUSD");
+    const p = Number(j?.result?.ZEURZUSD?.c?.[0]);
+    if (!(p > 0.5 && p < 2)) throw new Error("bad value " + p);
+    eurUsd = p; eurUsdAt = Date.now();
+  } catch (e) {
+    console.error("EUR/USD price error:", e.message);
+  }
+}
+const eurIsFresh = () => eurUsd !== null && Date.now() - eurUsdAt < PRICE_MAX_AGE_MS;
+
 // ---------- Telegram ----------
 async function tg(method, body) {
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -104,14 +129,27 @@ async function tg(method, body) {
   }
 }
 
-function buildCaption({ usd, dualAmt, pricePerDual, buyer, txHash }) {
-  return [
+function buildCaption({ venue = "uniswap", usd, dualAmt, pricePerDual, buyer, txHash, pair, fills }) {
+  const head = [
     `*DUAL Token Buy! 🟢*`,
     butterflies(usd),
     ``,
     `💲 ${formatUsd(usd)}`,
     `🔷 ${formatDual(dualAmt)}`,
     `💵 Price $${pricePerDual.toFixed(8)}`,
+  ];
+  if (venue === "kraken") {
+    const slug = pair.toLowerCase().replace("/", "-");
+    return [
+      ...head,
+      `📍 Kraken · ${pair}${fills > 1 ? ` · ${fills} fills` : ""}`,
+      ``,
+      `[Trade on Kraken](https://pro.kraken.com/app/trade/${slug}) · [Chart](https://dexscreener.com/ethereum/${DUAL_POOL})`,
+    ].join("\n");
+  }
+  return [
+    ...head,
+    `📍 Uniswap V3`,
     `👤 [${shortAddr(buyer)}](https://etherscan.io/address/${buyer})`,
     `🔗 [View TX](https://etherscan.io/tx/${txHash})`,
     ``,
@@ -121,7 +159,7 @@ function buildCaption({ usd, dualAmt, pricePerDual, buyer, txHash }) {
 
 async function sendAlert(alert) {
   const caption = buildCaption(alert);
-  if (DRY_RUN_TX) { console.log("---- DRY RUN caption ----\n" + caption + "\n-------------------------"); return; }
+  if (DRY_RUN) { console.log("---- DRY RUN caption ----\n" + caption + "\n-------------------------"); return; }
   for (const chatId of CHAT_IDS) {
     try {
       await tg("sendPhoto", { chat_id: chatId, photo: HEADER_IMG, caption, parse_mode: "Markdown" });
@@ -247,7 +285,101 @@ async function connect() {
   }
 }
 
+// ---------- Kraken trade feed ----------
+const krakenOrders  = new Map();   // "symbol|timestamp" → { pair, qty, notional, fills, timer }
+const krakenLastId  = new Map();   // symbol → last trade_id handled (skips repeats after reconnect)
+let krakenDelay     = 5000;
+
+function krakenFlush(key) {
+  const o = krakenOrders.get(key);
+  krakenOrders.delete(key);
+  if (!o) return;
+  const quote = o.pair.split("/")[1];
+  let fx = 1;
+  if (quote === "EUR") {
+    if (!eurIsFresh()) { console.error(`⚠️ Skipping Kraken ${o.pair} buy: EUR/USD price stale or missing`); return; }
+    fx = eurUsd;
+  } else if (quote !== "USD") {
+    console.error(`⚠️ Skipping Kraken ${o.pair} buy: no USD conversion for ${quote}`); return;
+  }
+  const usd = o.notional * fx;
+  console.log(`Kraken buy ${formatDual(o.qty)} on ${o.pair} (${formatUsd(usd)}, ${o.fills} fill(s))`);
+  if (usd < KRAKEN_MIN_USD) return;
+  sendAlert({ venue: "kraken", usd, dualAmt: o.qty, pricePerDual: usd / o.qty, pair: o.pair, fills: o.fills })
+    .catch(e => console.error("Kraken alert error:", e.message));
+}
+
+function krakenOnTrades(trades, { replay = false } = {}) {
+  for (const t of trades) {
+    if (!replay) {
+      const last = krakenLastId.get(t.symbol) ?? -1;
+      if (t.trade_id <= last) continue;
+      krakenLastId.set(t.symbol, t.trade_id);
+    }
+    if (t.side !== "buy") continue;   // side = the taker's side
+    const key = `${t.symbol}|${t.timestamp}`;
+    const o = krakenOrders.get(key) ?? { pair: t.symbol, qty: 0, notional: 0, fills: 0, timer: null };
+    o.qty += Number(t.qty);
+    o.notional += Number(t.qty) * Number(t.price);
+    o.fills += 1;
+    clearTimeout(o.timer);
+    o.timer = setTimeout(() => krakenFlush(key), 2000);  // wait briefly for the rest of the order's fills
+    krakenOrders.set(key, o);
+  }
+}
+
+function connectKraken({ replay = false } = {}) {
+  if (!KRAKEN_PAIRS.length) return;
+  if (typeof WebSocket !== "function") { console.error("❌ No WebSocket in this Node version; Kraken feed disabled."); return; }
+
+  console.log(`🔌 Connecting to Kraken (${KRAKEN_PAIRS.join(", ")})...`);
+  const ws = new WebSocket("wss://ws.kraken.com/v2");
+  let lastMsg = Date.now();
+  let dead = false;
+  const watchdog = setInterval(() => {
+    if (Date.now() - lastMsg > 60_000) fail("no data for 60s");
+  }, 15_000);
+
+  function fail(why) {
+    if (dead) return;
+    dead = true;
+    clearInterval(watchdog);
+    try { ws.close(); } catch {}
+    if (replay) return;
+    console.error(`Kraken connection lost: ${why}. Reconnecting in ${krakenDelay / 1000}s...`);
+    setTimeout(() => connectKraken(), krakenDelay);
+    krakenDelay = Math.min(krakenDelay * 2, 300_000);
+  }
+
+  ws.addEventListener("open", () => {
+    ws.send(JSON.stringify({ method: "subscribe", params: { channel: "trade", symbol: KRAKEN_PAIRS, snapshot: replay } }));
+  });
+  ws.addEventListener("message", ev => {
+    lastMsg = Date.now();
+    let m;
+    try { m = JSON.parse(ev.data); } catch { return; }
+    if (m.method === "subscribe") {
+      if (m.success) { console.log(`✅ Kraken subscribed: ${m.result?.symbol}`); krakenDelay = 5000; }
+      else console.error("Kraken subscribe failed:", m.error);
+      return;
+    }
+    if (m.channel !== "trade" || !Array.isArray(m.data)) return;
+    if (m.type === "snapshot" && !replay) return;   // old trades, never alert on them
+    krakenOnTrades(m.data, { replay });
+  });
+  ws.addEventListener("close", () => fail("socket closed"));
+  ws.addEventListener("error", e => fail("socket error " + (e?.message || "")));
+  return ws;
+}
+
 // ---------- replay mode ----------
+async function dryRunKraken() {
+  console.log(`Kraken dry run: replaying recent trades, min $${KRAKEN_MIN_USD}`);
+  await getEurUsd();
+  const ws = connectKraken({ replay: true });
+  setTimeout(() => { try { ws?.close(); } catch {} process.exit(0); }, 10_000);
+}
+
 async function dryRun() {
   if (!RPC_URL) { console.error("DRY_RUN_TX needs RPC_URL"); return; }
   const provider = new ethers.JsonRpcProvider(RPC_URL);
@@ -268,6 +400,7 @@ async function dryRun() {
 process.on("unhandledRejection", e => console.error("Unhandled rejection:", e?.message || e));
 
 async function main() {
+  if (DRY_RUN_KRAKEN) { await dryRunKraken(); return; }
   if (DRY_RUN_TX) { await dryRun(); return; }
 
   // Missing config: log and idle instead of exiting, so Railway doesn't restart-loop.
@@ -278,16 +411,19 @@ async function main() {
     return;
   }
 
-  console.log(`🦋 DUAL whale bot v7 — buys ≥ $${MIN_USD} → ${CHAT_IDS.length} chat(s)`);
+  console.log(`🦋 DUAL whale bot v8 — Uniswap buys ≥ $${MIN_USD}, Kraken buys ≥ $${KRAKEN_MIN_USD} → ${CHAT_IDS.length} chat(s)`);
   await getEthPrice();
+  await getEurUsd();
   setInterval(getEthPrice, 5 * 60 * 1000);
+  setInterval(getEurUsd, 5 * 60 * 1000);
 
   if (ADMIN_CHAT_ID) {
-    tg("sendMessage", { chat_id: ADMIN_CHAT_ID, text: `🦋 DUAL whale bot v7 started. Min $${MIN_USD}, ${CHAT_IDS.length} chat(s).` })
+    tg("sendMessage", { chat_id: ADMIN_CHAT_ID, text: `🦋 DUAL whale bot v8 started. Uniswap min $${MIN_USD}, Kraken min $${KRAKEN_MIN_USD}, ${CHAT_IDS.length} chat(s).` })
       .catch(e => console.error("Admin notice failed:", e.message));
   }
 
   connect();
+  connectKraken();
 }
 
 main();
